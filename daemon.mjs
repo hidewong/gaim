@@ -63,9 +63,15 @@ export async function runDaemon({
       if (error?.code !== "ENOENT") console.error(`gaim daemon cleanup: ${error.message}`);
     }
   };
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, () => server.close(() => process.exit(0)));
-  }
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    server.close(() => {
+      void core.shutdown().finally(() => process.exit(0));
+    });
+  };
+  for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, stop);
   process.once("exit", cleanup);
   return server;
 }

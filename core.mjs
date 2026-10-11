@@ -57,6 +57,21 @@ const SEARCH_DIRECTIVE = [
   "Cross-check multiple relevant sources when possible.",
 ].join(" ");
 
+export function buildSubmittedQuery(message, speaker) {
+  return `${message}\n\n${SEARCH_DIRECTIVE}\n[Speaker: ${speaker.name} (${speaker.id})]`;
+}
+
+export function browserEvaluationErrorMessage(exceptionDetails) {
+  return exceptionDetails?.exception?.description
+    ?? exceptionDetails?.exception?.value
+    ?? exceptionDetails?.text
+    ?? "Browser evaluation failed";
+}
+
+export function hasCompletedResponseToolbar(signalCount) {
+  return Number(signalCount) >= 2;
+}
+
 export class GaimError extends Error {
   constructor(code, message, details = {}) {
     super(message);
@@ -412,7 +427,7 @@ export class GoogleAiBrowser {
       const removeNetworkListener = page.on("Network.requestWillBeSent", ({ request }) => {
         if (isSearchRequest(request.url)) searchRequests.push(request.url);
       });
-      const submittedQuery = `${SEARCH_DIRECTIVE}\n\n[Speaker: ${speaker.name} (${speaker.id})]\n${message}`;
+      const submittedQuery = buildSubmittedQuery(message, speaker);
       await setComposerText(page, submittedQuery, this.config);
       const baseline = await readPageSnapshot(page, this.config);
       const submittedAt = new Date().toISOString();
@@ -490,7 +505,8 @@ export class GoogleAiBrowser {
         socket.addEventListener("error", reject, { once: true });
       });
       socket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
-      await delay(250);
+      await waitUntil(async () => !(await this.isConnected()), 5_000, "BROWSER_SHUTDOWN_TIMEOUT")
+        .catch(() => undefined);
       socket.close();
     } catch {
       // Chrome may already be gone.
@@ -504,18 +520,14 @@ export class GoogleAiBrowser {
 class CdpPage {
   constructor(target) {
     this.target = target;
-    this.socket = new WebSocket(target.webSocketDebuggerUrl);
+    this.socket = null;
     this.nextId = 1;
     this.pending = new Map();
     this.listeners = new Map();
   }
 
   async connect() {
-    await new Promise((resolve, reject) => {
-      if (this.socket.readyState === WebSocket.OPEN) return resolve();
-      this.socket.addEventListener("open", resolve, { once: true });
-      this.socket.addEventListener("error", reject, { once: true });
-    });
+    this.socket = await connectCdpSocket(this.target.webSocketDebuggerUrl);
     this.socket.addEventListener("message", (event) => this.onMessage(event));
     await this.send("Page.enable");
     await this.send("Runtime.enable");
@@ -556,7 +568,9 @@ class CdpPage {
       awaitPromise: true,
       returnByValue: true,
     });
-    if (exceptionDetails) throw new Error(exceptionDetails.text ?? "Browser evaluation failed");
+    if (exceptionDetails) {
+      throw new Error(browserEvaluationErrorMessage(exceptionDetails));
+    }
     return result?.value;
   }
 
@@ -570,8 +584,56 @@ class CdpPage {
   }
 
   closeSocket() {
-    this.socket.close();
+    this.socket?.close();
   }
+}
+
+async function connectCdpSocket(url, timeoutMs = 5_000) {
+  const startedAt = Date.now();
+  let lastError;
+  while (Date.now() - startedAt < timeoutMs) {
+    let socket;
+    try {
+      socket = new WebSocket(url);
+      await waitForSocketOpen(socket, Math.min(1_000, timeoutMs - (Date.now() - startedAt)));
+      return socket;
+    } catch (error) {
+      lastError = error;
+      socket?.close();
+      await delay(100);
+    }
+  }
+  throw new GaimError("BROWSER_UNAVAILABLE", "Could not connect to the Chrome DevTools target.", {
+    cause: errorMessage(lastError),
+  });
+}
+
+function waitForSocketOpen(socket, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve();
+      return;
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+    };
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (event) => {
+      cleanup();
+      reject(event?.error ?? event);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Chrome DevTools WebSocket connection timed out."));
+    }, Math.max(timeoutMs, 1));
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("error", onError, { once: true });
+  });
 }
 
 function emptyState() {
@@ -738,7 +800,7 @@ async function clickSubmit(page, config) {
 }
 
 async function readPageSnapshot(page, config) {
-  return page.evaluate(`(() => {
+  const snapshot = await page.evaluate(`(() => {
     const visible = (element) => {
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -757,23 +819,25 @@ async function readPageSnapshot(page, config) {
       .flatMap((selector) => [...document.querySelectorAll(selector)]).find(visible);
     const stopVisible = ${JSON.stringify(config.selectors.stopControl)}
       .some((selector) => [...document.querySelectorAll(selector)].some(visible));
-    const completionVisible = ${JSON.stringify(config.selectors.completionCopyControl)}
-      .some((selector) => [...root.querySelectorAll(selector)].some(visible))
-      && ${JSON.stringify(config.selectors.completionCompanionControl)}
-        .some((selector) => [...root.querySelectorAll(selector)].some(visible));
+    const completionSignals = new Set(
+      [
+        ...${JSON.stringify(config.selectors.completionCopyControl)},
+        ...${JSON.stringify(config.selectors.completionCompanionControl)},
+      ].flatMap((selector) => [...root.querySelectorAll(selector)].filter(visible)),
+    );
     return {
       url: location.href,
       rootKey: root.getAttribute('jsuid') || root.getAttribute('data-container-id') || root.tagName,
       answer: (root?.innerText ?? '').trim(),
       html: root?.innerHTML ?? '',
       stopVisible,
-      completionVisible,
+      completionSignalCount: completionSignals.size,
       citationBadgeTexts: [...root.querySelectorAll('button[aria-label], [role="button"][aria-label]')]
         .filter(visible)
         .map((element) => {
           const text = (element.innerText ?? '').trim();
           const label = (element.getAttribute('aria-label') ?? '').trim();
-          const title = text.split(/\r?\n/, 1)[0].trim();
+          const title = text.split(String.fromCharCode(10), 1)[0].trim();
           return { label, text, title };
         })
         .filter(({ label, text, title }) => text && title
@@ -787,6 +851,10 @@ async function readPageSnapshot(page, config) {
       })),
     };
   })()`);
+  return {
+    ...snapshot,
+    completionVisible: hasCompletedResponseToolbar(snapshot.completionSignalCount),
+  };
 }
 
 async function waitForSubmission(page, baseline, config) {
@@ -1005,8 +1073,15 @@ export function normalizeError(error) {
   if (error instanceof GaimError) return { code: error.code, message: error.message, ...error.details };
   return {
     code: typeof error?.code === "string" ? error.code : "INTERNAL_ERROR",
-    message: error instanceof Error ? error.message : String(error),
+    message: errorMessage(error),
   };
+}
+
+function errorMessage(error) {
+  if (typeof error?.message === "string" && error.message) return error.message;
+  if (typeof error?.error?.message === "string" && error.error.message) return error.error.message;
+  if (typeof error?.type === "string" && error.type) return `Browser ${error.type} event`;
+  return String(error);
 }
 
 async function waitUntil(check, timeoutMs, code) {

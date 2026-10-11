@@ -4,12 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  browserEvaluationErrorMessage,
+  buildSubmittedQuery,
   extractEmbeddedSourceUrls,
   GaimCore,
   GaimError,
+  hasCompletedResponseToolbar,
   isCompleteAnswerSnapshot,
   isSubmissionAccepted,
   JsonStateStore,
+  GoogleAiBrowser,
+  normalizeError,
   resolveSources,
   responseErrorFromAnswer,
   stripInlineSourceBadges,
@@ -68,6 +73,94 @@ async function fixture(options = {}) {
 
 const codex = { id: "codex-main", name: "Codex" };
 const claude = { id: "claude-reviewer", name: "Claude" };
+
+test("the user question stays primary while every turn requires fresh search", () => {
+  const query = buildSubmittedQuery("What changed this week?", codex);
+  assert.equal(query.startsWith("What changed this week?\n\n"), true);
+  assert.match(query, /perform a fresh and thorough Google web search/);
+  assert.equal(query.endsWith("[Speaker: Codex (codex-main)]"), true);
+});
+
+test("browser evaluation failures preserve the actionable JavaScript error", () => {
+  assert.equal(browserEvaluationErrorMessage({
+    text: "Uncaught",
+    exception: { description: "SyntaxError: Invalid regular expression: missing /" },
+  }), "SyntaxError: Invalid regular expression: missing /");
+});
+
+test("browser event failures preserve their nested error message", () => {
+  assert.deepEqual(normalizeError({
+    type: "error",
+    error: new Error("connect ECONNREFUSED"),
+  }), {
+    code: "INTERNAL_ERROR",
+    message: "connect ECONNREFUSED",
+  });
+});
+
+test("a new Chrome target tolerates a transient DevTools socket race", async () => {
+  const originalFetch = globalThis.fetch;
+  const OriginalWebSocket = globalThis.WebSocket;
+  let attempts = 0;
+
+  class FakeWebSocket extends EventTarget {
+    static OPEN = 1;
+
+    constructor() {
+      super();
+      attempts += 1;
+      this.readyState = 0;
+      queueMicrotask(() => {
+        if (attempts === 1) {
+          const event = new Event("error");
+          Object.defineProperty(event, "error", { value: new Error("target not ready") });
+          this.dispatchEvent(event);
+          return;
+        }
+        this.readyState = FakeWebSocket.OPEN;
+        this.dispatchEvent(new Event("open"));
+      });
+    }
+
+    send(payload) {
+      const { id } = JSON.parse(payload);
+      queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", {
+        data: JSON.stringify({ id, result: {} }),
+      })));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  }
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ id: "target-1", webSocketDebuggerUrl: "ws://chrome.test/devtools/page/1" }),
+  });
+  globalThis.WebSocket = FakeWebSocket;
+  const browser = new GoogleAiBrowser({
+    cdpHost: "127.0.0.1",
+    cdpPort: 9224,
+    selectors: {},
+  });
+  browser.ensureBrowser = async () => undefined;
+
+  try {
+    const page = await browser.openPage("https://example.test");
+    assert.equal(attempts, 2);
+    page.closeSocket();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = OriginalWebSocket;
+  }
+});
+
+test("a completed response toolbar does not require a Copy button", () => {
+  assert.equal(hasCompletedResponseToolbar(3), true);
+  assert.equal(hasCompletedResponseToolbar(2), true);
+  assert.equal(hasCompletedResponseToolbar(1), false);
+});
 
 test("only a new answer with its completed-response toolbar is complete", () => {
   const baseline = { rootKey: "old-answer" };
