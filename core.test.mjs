@@ -12,6 +12,7 @@ import {
   JsonStateStore,
   resolveSources,
   responseErrorFromAnswer,
+  stripInlineSourceBadges,
 } from "./core.mjs";
 
 class FakeBrowser {
@@ -131,6 +132,23 @@ test("explicit answer sources win over unrelated embedded page metadata", async 
     { title: "", url: "http://www.w3.org/2000/svg" },
   ], '<a href="https://unrelated.example/old-turn">old metadata</a>');
   assert.deepEqual(sources, [{ title: "Node.js", url: "https://nodejs.org/en" }]);
+});
+
+test("inline source badge text is excluded without removing prose mentions", () => {
+  const answer = [
+    "Node.js runs JavaScript outside the browser.",
+    "Node.js",
+    " +2",
+    "Wikipedia describes its history in more detail.",
+    "Wikipedia",
+    "The final sentence remains.",
+  ].join("\n");
+
+  assert.equal(stripInlineSourceBadges(answer, ["Node.js\n +2", "Wikipedia"]), [
+    "Node.js runs JavaScript outside the browser.",
+    "Wikipedia describes its history in more detail.",
+    "The final sentence remains.",
+  ].join("\n"));
 });
 
 test("new turns are isolated unless a conversation id is supplied", async () => {

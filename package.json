@@ -1,6 +1,6 @@
 {
   "name": "googaim",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "GAIM (pronounced game): Google AI Mode for every local agent",
   "type": "module",
   "bin": {

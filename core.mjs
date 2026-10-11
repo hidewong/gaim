@@ -421,6 +421,7 @@ export class GoogleAiBrowser {
       removeNetworkListener();
 
       const sources = await resolveSources(result.links, result.html);
+      const answer = stripInlineSourceBadges(result.answer, result.citationBadgeTexts);
       const evidence = {
         fresh_search: searchRequests.length > 0,
         search_request_count: searchRequests.length,
@@ -428,7 +429,7 @@ export class GoogleAiBrowser {
         generation_complete: result.generationComplete,
         submitted_at: submittedAt,
         completed_at: new Date().toISOString(),
-        answer_sha256: createHash("sha256").update(result.answer).digest("hex"),
+        answer_sha256: createHash("sha256").update(answer).digest("hex"),
       };
       if (!evidence.fresh_search || sources.length < this.config.minimumSources) {
         throw new GaimError(
@@ -439,7 +440,7 @@ export class GoogleAiBrowser {
       }
       this.lastError = null;
       return {
-        answer_markdown: result.answer,
+        answer_markdown: answer,
         sources,
         conversation_url: result.url,
         search_evidence: evidence,
@@ -767,6 +768,18 @@ async function readPageSnapshot(page, config) {
       html: root?.innerHTML ?? '',
       stopVisible,
       completionVisible,
+      citationBadgeTexts: [...root.querySelectorAll('button[aria-label], [role="button"][aria-label]')]
+        .filter(visible)
+        .map((element) => {
+          const text = (element.innerText ?? '').trim();
+          const label = (element.getAttribute('aria-label') ?? '').trim();
+          const title = text.split(/\r?\n/, 1)[0].trim();
+          return { label, text, title };
+        })
+        .filter(({ label, text, title }) => text && title
+          && label.toLocaleLowerCase().startsWith(title.toLocaleLowerCase())
+          && label.toLocaleLowerCase() !== title.toLocaleLowerCase())
+        .map(({ text }) => text),
       composerValue: composer ? (composer.value ?? composer.textContent ?? '').trim() : null,
       links: [...root.querySelectorAll('a[href]')].map((link) => ({
         title: (link.innerText || link.getAttribute('aria-label') || link.title || '').trim(),
@@ -832,6 +845,33 @@ export function isCompleteAnswerSnapshot(baseline, current) {
     && current.completionVisible === true
     && current.stopVisible === false
     && current.answer.length > 80;
+}
+
+export function stripInlineSourceBadges(answer, badgeTexts = []) {
+  const lines = String(answer ?? "").split(/\r?\n/);
+  const normalize = (line) => line.replace(/\u00a0/g, " ").trim().replace(/\s+/g, " ");
+  let cursor = 0;
+
+  for (const badgeText of badgeTexts) {
+    const expected = String(badgeText ?? "")
+      .split(/\r?\n/)
+      .map(normalize)
+      .filter(Boolean);
+    if (!expected.length) continue;
+
+    let found = -1;
+    for (let index = cursor; index <= lines.length - expected.length; index += 1) {
+      if (expected.every((value, offset) => normalize(lines[index + offset]) === value)) {
+        found = index;
+        break;
+      }
+    }
+    if (found < 0) continue;
+    lines.splice(found, expected.length);
+    cursor = found;
+  }
+
+  return lines.join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export async function resolveSources(links, html) {
