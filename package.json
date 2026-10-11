@@ -1,0 +1,48 @@
+{
+  "name": "googaim",
+  "version": "0.1.0",
+  "description": "GAIM (pronounced game): Google AI Mode for every local agent",
+  "type": "module",
+  "bin": {
+    "gaim": "gaim.mjs"
+  },
+  "files": [
+    "client.mjs",
+    "core.mjs",
+    "daemon.mjs",
+    "gaim.mjs",
+    "gaim-acp.mjs",
+    "gaim-mcp.mjs",
+    "meta.mjs",
+    "platform.mjs",
+    "paths.mjs",
+    "assets",
+    "skills"
+  ],
+  "scripts": {
+    "test": "node --test core.test.mjs platform.test.mjs protocol.test.mjs",
+    "e2e": "node e2e.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "ai-agent",
+    "agent-skill",
+    "acp",
+    "mcp",
+    "google-ai-mode",
+    "codex",
+    "claude-code",
+    "opencode",
+    "pi",
+    "hermes",
+    "devspace"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.1.0",
+    "zod": "4.4.3"
+  }
+}
